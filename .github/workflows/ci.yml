@@ -20,7 +20,7 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   test:
@@ -51,13 +51,11 @@ jobs:
     name: Train and log to DagsHub
     needs: test
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     env:
       MLFLOW_TRACKING_URI: https://dagshub.com/${{ vars.DAGSHUB_USERNAME }}/${{ vars.DAGSHUB_REPO }}.mlflow
       MLFLOW_TRACKING_USERNAME: ${{ vars.DAGSHUB_USERNAME }}
       MLFLOW_TRACKING_PASSWORD: ${{ secrets.DAGSHUB_TOKEN }}
-      MLFLOW_HTTP_REQUEST_MAX_RETRIES: '3'
-      MLFLOW_HTTP_REQUEST_TIMEOUT: '30'
     steps:
       - uses: actions/checkout@v4
 
@@ -93,6 +91,7 @@ jobs:
           fi
 
       - name: Train
+        timeout-minutes: 15
         run: |
           python train.py \
             --epochs "${{ inputs.epochs || '50' }}" \
