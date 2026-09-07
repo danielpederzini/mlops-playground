@@ -1,17 +1,21 @@
 import argparse
 import os
 import random as python_random
+from pathlib import Path
 
 import mlflow
 import numpy as np
 import pandas as pd
 import tensorflow as tf
+from dotenv import load_dotenv
 from keras.layers import Dense, InputLayer
 from keras.models import Sequential
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
-DEFAULT_TRACKING_URI = 'http://localhost:5000'
+DEFAULT_TRACKING_URI = ('https://dagshub.com/pederzinidaniel/'
+                        'my-first-repo.mlflow')
+DOTENV_PATH = Path(__file__).with_name('.env')
 
 
 def parse_args(argv=None):
@@ -127,6 +131,7 @@ def train(model, X_train, y_train, X_test, y_test, args):
 
 
 def main(argv=None):
+    load_dotenv(DOTENV_PATH)
     args = parse_args(argv)
 
     X, y = load_data(args.data_path, args.target)
