@@ -1,22 +1,26 @@
 import argparse
 import os
 import random as python_random
+import tempfile
 from pathlib import Path
 
 import mlflow
+import mlflow.sklearn
 import numpy as np
 import pandas as pd
 import tensorflow as tf
 from dotenv import load_dotenv
 from keras.layers import Dense, InputLayer
 from keras.models import Sequential
+from keras.wrappers import SKLearnClassifier
+from sklearn.metrics import accuracy_score, log_loss
 from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 DEFAULT_TRACKING_URI = ('https://dagshub.com/pederzinidaniel/'
                         'my-first-repo.mlflow')
 DOTENV_PATH = Path(__file__).with_name('.env')
-
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
@@ -65,6 +69,11 @@ def parse_args(argv=None):
                           help='MLflow experiment (default: %(default)s)')
     tracking.add_argument('--run-name', default=None,
                           help='MLflow run name (default: auto-generated)')
+    tracking.add_argument('--registered-model-name',
+                          default='fetal_health_classifier',
+                          help='Name to register the model under in the '
+                               'MLflow Model Registry '
+                               '(default: %(default)s)')
     tracking.add_argument('--no-mlflow', action='store_true',
                           help='Train without logging to MLflow')
 
@@ -97,12 +106,10 @@ def load_data(path, target):
 
 
 def preprocess(X, y, test_size, seed):
-    column_names = list(X.columns)
-    scaler = StandardScaler()
-    X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=column_names)
-
+    """Split into train/test. Scaling is handled by the pipeline so that
+    the scaler is fit on the training split only."""
     X_train, X_test, y_train, y_test = train_test_split(
-        X_scaled, y, test_size=test_size, random_state=seed)
+        X, y, test_size=test_size, random_state=seed)
 
     return (X_train.to_numpy(dtype='float32'),
             X_test.to_numpy(dtype='float32'),
@@ -110,24 +117,67 @@ def preprocess(X, y, test_size, seed):
             (y_test - 1).to_numpy())
 
 
-def build_model(n_features, n_classes, args):
+def build_model(n_features, n_classes, args,
+                loss='sparse_categorical_crossentropy'):
     reset_seeds(args.seed)
     model = Sequential()
     model.add(InputLayer(shape=(n_features,)))
     for units in args.hidden:
         model.add(Dense(units, activation=args.activation))
     model.add(Dense(n_classes, activation='softmax'))
-    model.compile(optimizer=args.optimizer,
-                  loss='sparse_categorical_crossentropy',
+    model.compile(optimizer=args.optimizer, loss=loss,
                   metrics=['accuracy'])
     return model
 
 
-def train(model, X_train, y_train, X_test, y_test, args):
-    model.fit(X_train, y_train, epochs=args.epochs,
-              batch_size=args.batch_size,
-              validation_split=args.validation_split, verbose=args.verbose)
-    return model.evaluate(X_test, y_test, verbose=0)
+def _build_wrapped_model(X, y, args):
+    """Model factory for SKLearnClassifier, which one-hot encodes the
+    target before calling this and passes X/y as keyword arguments."""
+    n_classes = y.shape[1] if y.ndim > 1 else len(np.unique(y))
+    return build_model(X.shape[1], n_classes, args,
+                       loss='categorical_crossentropy')
+
+
+def build_pipeline(args):
+    """Scaler + Keras classifier as one estimator, so that inference
+    applies exactly the same scaling that was fit during training."""
+    classifier = SKLearnClassifier(
+        model=_build_wrapped_model,
+        model_kwargs={'args': args},
+        fit_kwargs={'epochs': args.epochs,
+                    'batch_size': args.batch_size,
+                    'validation_split': args.validation_split,
+                    'verbose': args.verbose})
+    return Pipeline([('scaler', StandardScaler()),
+                     ('classifier', classifier)])
+
+
+def train(pipeline, X_train, y_train, X_test, y_test, args):
+    pipeline.fit(X_train, y_train)
+
+    probabilities = pipeline.decision_function(X_test)
+    test_loss = log_loss(y_test, probabilities,
+                         labels=np.unique(y_train))
+    test_accuracy = accuracy_score(y_test, pipeline.predict(X_test))
+    return test_loss, test_accuracy
+
+
+def log_pipeline(pipeline, input_example, run_id, args):
+    """Save, upload, and register the fitted pipeline for a run.
+
+    cloudpickle is required because the default skops format cannot
+    serialize the Keras network inside the pipeline. Saving and uploading
+    the artifacts separately avoids MLflow 3's logged-model metric backfill,
+    which DagsHub rejects with BAD_REQUEST.
+    """
+    with tempfile.TemporaryDirectory(prefix='mlflow-model-') as local_dir:
+        mlflow.sklearn.save_model(
+            pipeline, local_dir, input_example=input_example,
+            serialization_format='cloudpickle')
+        mlflow.log_artifacts(local_dir, artifact_path='model')
+
+    return mlflow.register_model(
+        f'runs:/{run_id}/model', args.registered_model_name)
 
 
 def main(argv=None):
@@ -137,16 +187,15 @@ def main(argv=None):
     X, y = load_data(args.data_path, args.target)
     X_train, X_test, y_train, y_test = preprocess(
         X, y, args.test_size, args.seed)
-    n_classes = len(np.unique(y_train))
-    model = build_model(X.shape[1], n_classes, args)
+    pipeline = build_pipeline(args)
 
     if args.no_mlflow:
         test_loss, test_accuracy = train(
-            model, X_train, y_train, X_test, y_test, args)
+            pipeline, X_train, y_train, X_test, y_test, args)
     else:
         mlflow.set_tracking_uri(args.tracking_uri)
         mlflow.set_experiment(args.experiment_name)
-        mlflow.tensorflow.autolog(log_models=True, log_input_examples=True,
+        mlflow.tensorflow.autolog(log_models=False, log_input_examples=True,
                                   log_model_signatures=True, checkpoint=False)
 
         with mlflow.start_run(run_name=args.run_name) as run:
@@ -158,9 +207,10 @@ def main(argv=None):
                 'cli_data_path': args.data_path,
             })
             test_loss, test_accuracy = train(
-                model, X_train, y_train, X_test, y_test, args)
+                pipeline, X_train, y_train, X_test, y_test, args)
             mlflow.log_metrics({'test_loss': test_loss,
                                 'test_accuracy': test_accuracy})
+            log_pipeline(pipeline, X_test[:2], run.info.run_id, args)
         print(f'run_id: {run.info.run_id}')
 
     print(f'test_loss: {test_loss:.4f}')
