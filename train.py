@@ -22,6 +22,7 @@ DEFAULT_TRACKING_URI = ('https://dagshub.com/pederzinidaniel/'
                         'my-first-repo.mlflow')
 DOTENV_PATH = Path(__file__).with_name('.env')
 
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description='Train a Keras classifier on the fetal health dataset '
