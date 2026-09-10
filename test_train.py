@@ -127,12 +127,14 @@ class TestPreprocess:
         assert set(np.unique(y_test)) <= {0, 1, 2}
         assert y_train.min() >= 0
 
-    def test_features_are_standardised(self, csv_path):
+    def test_features_are_not_scaled_here(self, csv_path):
+        """Scaling belongs to the pipeline, so that the scaler is fit on
+        the training split only rather than on the whole dataset."""
         X, y = train_module.load_data(csv_path, 'fetal_health')
         X_train, X_test, _, _ = train_module.preprocess(X, y, 0.2, 42)
         combined = np.vstack([X_train, X_test])
-        assert np.allclose(combined.mean(axis=0), 0, atol=1e-5)
-        assert np.allclose(combined.std(axis=0), 1, atol=1e-5)
+        assert np.allclose(np.sort(combined, axis=0),
+                           np.sort(X.to_numpy(dtype='float32'), axis=0))
 
     def test_split_is_deterministic_for_a_seed(self, csv_path):
         X, y = train_module.load_data(csv_path, 'fetal_health')
@@ -173,6 +175,91 @@ class TestBuildModel:
         assert model.optimizer.name.lower() == 'sgd'
 
 
+class TestBuildPipeline:
+    def test_pipeline_bundles_scaler_and_classifier(self):
+        args = train_module.parse_args(['--hidden', '4'])
+        pipeline = train_module.build_pipeline(args)
+        assert list(pipeline.named_steps) == ['scaler', 'classifier']
+
+    def test_scaler_is_fit_on_training_data_only(self, csv_path):
+        """The whole point of the pipeline: the scaler must learn its
+        statistics from the training split, not from the test split."""
+        X, y = train_module.load_data(csv_path, 'fetal_health')
+        X_train, _, y_train, _ = train_module.preprocess(X, y, 0.2, 42)
+        args = train_module.parse_args(
+            ['--hidden', '4', '--epochs', '1', '--verbose', '0'])
+        pipeline = train_module.build_pipeline(args)
+        pipeline.fit(X_train, y_train)
+
+        scaler = pipeline.named_steps['scaler']
+        assert np.allclose(scaler.mean_, X_train.mean(axis=0), atol=1e-5)
+        assert scaler.n_features_in_ == X_train.shape[1]
+
+    def test_fitted_pipeline_scales_raw_input_for_inference(self, csv_path):
+        """Callers pass raw, unscaled features; the pipeline scales them."""
+        X, y = train_module.load_data(csv_path, 'fetal_health')
+        X_train, X_test, y_train, _ = train_module.preprocess(X, y, 0.2, 42)
+        args = train_module.parse_args(
+            ['--hidden', '4', '--epochs', '1', '--verbose', '0'])
+        pipeline = train_module.build_pipeline(args)
+        pipeline.fit(X_train, y_train)
+
+        scaled = pipeline.named_steps['scaler'].transform(X_test)
+        assert not np.allclose(scaled, X_test)
+
+        probabilities = pipeline.decision_function(X_test)
+        assert probabilities.shape == (len(X_test), 3)
+        assert np.allclose(probabilities.sum(axis=1), 1, atol=1e-5)
+        assert set(np.unique(pipeline.predict(X_test))) <= {0, 1, 2}
+
+
+class TestLogPipeline:
+    @pytest.fixture
+    def recorded(self, monkeypatch):
+        calls = {}
+
+        def fake_save_model(model, path, **kwargs):
+            calls['save_model'] = dict(kwargs, model=model, path=path)
+
+        monkeypatch.setattr(train_module.mlflow.sklearn, 'save_model',
+                            fake_save_model)
+        monkeypatch.setattr(
+            train_module.mlflow, 'log_artifacts',
+            lambda path, artifact_path: calls.__setitem__(
+                'log_artifacts',
+                {'path': path, 'artifact_path': artifact_path}))
+        monkeypatch.setattr(
+            train_module.mlflow, 'register_model',
+            lambda model_uri, name: calls.__setitem__(
+                'register_model', {'model_uri': model_uri, 'name': name}))
+        return calls
+
+    def _log(self, recorded):
+        args = train_module.parse_args(['--hidden', '4'])
+        pipeline = train_module.build_pipeline(args)
+        train_module.log_pipeline(pipeline, np.zeros((2, 4)), 'run-123', args)
+        return recorded
+
+    def test_logs_the_whole_pipeline_not_just_the_network(self, recorded):
+        """The scaler must ship with the model, so the logged artifact has
+        to be the pipeline rather than the bare Keras network."""
+        logged = self._log(recorded)
+        assert list(logged['save_model']['model'].named_steps) == [
+            'scaler', 'classifier']
+        assert logged['log_artifacts']['artifact_path'] == 'model'
+        assert logged['log_artifacts']['path'] == logged['save_model']['path']
+        assert logged['register_model'] == {
+            'model_uri': 'runs:/run-123/model',
+            'name': 'fetal_health_classifier',
+        }
+
+    def test_uses_cloudpickle_because_skops_cannot_hold_keras(self,
+                                                              recorded):
+        logged = self._log(recorded)['save_model']
+        assert logged['serialization_format'] == 'cloudpickle'
+        assert len(logged['input_example']) == 2
+
+
 class TestMain:
     def test_no_mlflow_run_trains_without_touching_mlflow(
             self, fast_args, monkeypatch, capsys):
@@ -192,7 +279,8 @@ class TestMain:
 
     def test_mlflow_path_logs_expected_params_and_metrics(
             self, fast_args, monkeypatch, capsys):
-        calls = {'params': {}, 'metrics': {}, 'autolog': {}}
+        calls = {'params': {}, 'metrics': {}, 'autolog': {},
+                 'log_model': {}}
 
         @contextlib.contextmanager
         def fake_start_run(run_name=None, **kwargs):
@@ -212,6 +300,11 @@ class TestMain:
         monkeypatch.setattr(train_module.mlflow, 'log_metrics',
                             calls['metrics'].update)
 
+        monkeypatch.setattr(
+            train_module, 'log_pipeline',
+            lambda pipeline, example, run_id, args: calls['log_model'].update(
+                steps=list(pipeline.named_steps), run_id=run_id))
+
         train_module.main(fast_args + ['--experiment-name', 'exp',
                                        '--tracking-uri', 'http://x:1',
                                        '--run-name', 'named'])
@@ -220,11 +313,13 @@ class TestMain:
         assert calls['experiment'] == 'exp'
         assert calls['run_name'] == 'named'
         assert calls['autolog']['checkpoint'] is False
-        assert calls['autolog']['log_models'] is True
+        assert calls['autolog']['log_models'] is False
         assert calls['params']['cli_hidden'] == '4'
         assert calls['params']['cli_seed'] == 42
         assert set(calls['metrics']) == {'test_loss', 'test_accuracy'}
         assert 0.0 <= calls['metrics']['test_accuracy'] <= 1.0
+        assert calls['log_model']['steps'] == ['scaler', 'classifier']
+        assert calls['log_model']['run_id'] == 'abc123'
         assert 'run_id: abc123' in capsys.readouterr().out
 
     def test_dotenv_supplies_tracking_uri(self, fast_args, tmp_path,
@@ -249,6 +344,8 @@ class TestMain:
         monkeypatch.setattr(train_module.mlflow, 'start_run', fake_start_run)
         monkeypatch.setattr(train_module.mlflow, 'log_params', lambda p: None)
         monkeypatch.setattr(train_module.mlflow, 'log_metrics', lambda m: None)
+        monkeypatch.setattr(train_module, 'log_pipeline',
+                            lambda *a, **kw: None)
 
         train_module.main(fast_args)
 
@@ -276,6 +373,8 @@ class TestMain:
         monkeypatch.setattr(train_module.mlflow, 'start_run', fake_start_run)
         monkeypatch.setattr(train_module.mlflow, 'log_params', lambda p: None)
         monkeypatch.setattr(train_module.mlflow, 'log_metrics', lambda m: None)
+        monkeypatch.setattr(train_module, 'log_pipeline',
+                            lambda *a, **kw: None)
 
         train_module.main(fast_args)
 
