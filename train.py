@@ -21,6 +21,7 @@ from sklearn.preprocessing import StandardScaler
 DEFAULT_TRACKING_URI = ('https://dagshub.com/pederzinidaniel/'
                         'my-first-repo.mlflow')
 DOTENV_PATH = Path(__file__).with_name('.env')
+DEFAULT_DATA_PATH = 'data/reference/fetal_health.csv'
 
 
 def parse_args(argv=None):
@@ -29,7 +30,7 @@ def parse_args(argv=None):
                     'and log the run to MLflow.')
 
     data = parser.add_argument_group('data')
-    data.add_argument('--data-path', default='fetal_health.csv',
+    data.add_argument('--data-path', default=DEFAULT_DATA_PATH,
                       help='CSV file to train on (default: %(default)s)')
     data.add_argument('--target', default='fetal_health',
                       help='Name of the label column (default: %(default)s)')

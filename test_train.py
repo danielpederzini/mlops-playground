@@ -31,7 +31,7 @@ def fast_args(csv_path):
 class TestParseArgs:
     def test_defaults_match_documented_behaviour(self):
         args = train_module.parse_args([])
-        assert args.data_path == 'fetal_health.csv'
+        assert args.data_path == 'data/reference/fetal_health.csv'
         assert args.target == 'fetal_health'
         assert args.epochs == 50
         assert args.batch_size == 32
