@@ -3,3 +3,4 @@ mlartifacts
 mlflow.db
 *.pyc
 .env
+reports/

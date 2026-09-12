@@ -40,7 +40,7 @@ jobs:
         run: python -m pip install pycodestyle==2.14.0
 
       - name: Check style
-        run: pycodestyle train.py test_train.py
+        run: pycodestyle train.py tests
 
   test:
     name: Test
@@ -63,6 +63,14 @@ jobs:
 
       - name: Run tests
         run: pytest -q
+
+      - name: Upload drift report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-drift-report
+          path: reports/data_drift_report.*
+          if-no-files-found: warn
 
   train:
     name: Train and log to DagsHub
